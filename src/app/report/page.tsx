@@ -144,67 +144,91 @@ function ReportInner() {
       toast("error", tr("GPS not supported", "GPS समर्थित नहीं"), tr("Tap the map or type the address.", "नक्शे पर टैप करें या पता लिखें।"));
       return;
     }
+    if (typeof window !== "undefined" && !window.isSecureContext) {
+      toast("error", tr("Needs HTTPS", "HTTPS चाहिए"), tr("Open the https:// link of the site.", "साइट का https:// लिंक खोलें।"));
+      return;
+    }
     setLocating(true);
-    // Keep listening for up to 15 s and use the most accurate fix (laptops often give a rough Wi-Fi fix first).
-    let best: GeolocationPosition | null = null;
-    let finished = false;
-    let watchId = 0;
-    let timer: ReturnType<typeof setTimeout>;
+    let bestAcc = Infinity;
+    let gotAny = false;
+    let watchId = -1;
+    let stopTimer: ReturnType<typeof setTimeout> | undefined;
+    let reverseSeq = 0;
 
-    const finish = async () => {
-      if (finished) return;
-      finished = true;
-      navigator.geolocation.clearWatch(watchId);
-      clearTimeout(timer);
-      if (!best) {
-        setLocating(false);
-        toast("error", tr("Location failed", "स्थान नहीं मिला"), tr("Could not get a position. Turn on device location or tap the map.", "स्थिति नहीं मिली। डिवाइस लोकेशन चालू करें या नक्शे पर टैप करें।"));
-        return;
-      }
-      const { latitude: lat, longitude: lng, accuracy } = best.coords;
-      let addr: string | undefined;
+    const stopAll = () => {
+      if (watchId >= 0) navigator.geolocation.clearWatch(watchId);
+      if (stopTimer) clearTimeout(stopTimer);
+      setLocating(false);
+    };
+
+    const apply = async (pos: GeolocationPosition) => {
+      const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+      if (accuracy >= bestAcc) return; // only accept better fixes
+      bestAcc = accuracy;
+      gotAny = true;
+      setLocation(lat, lng, `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
+      const seq = ++reverseSeq;
       try {
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 4000);
         const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`, { signal: ctrl.signal });
         clearTimeout(t);
         const j = await r.json();
-        if (j?.display_name) addr = String(j.display_name);
+        if (j?.display_name && seq === reverseSeq) setAddress(String(j.display_name));
       } catch {
         /* address lookup is optional */
       }
-      setLocation(lat, lng, addr ?? `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
-      setLocating(false);
       const m = Math.round(accuracy);
-      if (accuracy > 150) {
-        toast("warning", tr("Location is rough", "स्थान मोटा-मोटा है"), tr(`Accuracy about ${m} m (laptop Wi-Fi location). Edit the address, or open this site on your phone for exact GPS.`, `सटीकता लगभग ${m} मीटर (लैपटॉप का Wi-Fi स्थान)। पता सुधारें, या सटीक GPS के लिए फ़ोन पर खोलें।`));
-      } else {
+      if (accuracy <= 50) {
         toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${m} m.`, `सटीकता लगभग ${m} मीटर।`));
+        stopAll();
       }
     };
 
-    watchId = navigator.geolocation.watchPosition(
+    const failMsg = (code: number) =>
+      code === 1
+        ? tr("Location permission denied. In Chrome: tap the lock/settings icon next to the address → Permissions → Location → Allow, then reload.", "स्थान की अनुमति नहीं मिली। Chrome में एड्रेस के पास लॉक/सेटिंग आइकन → Permissions → Location → Allow करें, फिर पेज रीलोड करें।")
+        : tr("Could not get your position. Turn ON phone Location (GPS), set it to High accuracy, go near a window/outdoors and try again. Or tap the map.", "स्थिति नहीं मिली। फ़ोन की Location (GPS) चालू करें, High accuracy रखें, खिड़की/बाहर जाकर दोबारा कोशिश करें। या नक्शे पर टैप करें।");
+
+    // Stage 1: fast network/cached position so the pin appears quickly.
+    navigator.geolocation.getCurrentPosition(
       (pos) => {
-        if (!best || pos.coords.accuracy < best.coords.accuracy) best = pos;
-        if (pos.coords.accuracy <= 30) finish();
+        apply(pos);
       },
       (err) => {
-        if (best) return;
-        finished = true;
-        navigator.geolocation.clearWatch(watchId);
-        clearTimeout(timer);
-        setLocating(false);
-        const msg =
-          err.code === 1
-            ? tr("Location permission denied. Click the lock icon in the address bar, set Location to Allow, then refresh.", "स्थान की अनुमति नहीं मिली। एड्रेस बार के लॉक आइकन से Location को Allow करें और पेज रिफ्रेश करें।")
-            : err.code === 2
-            ? tr("Could not determine position. Turn on Windows/phone location services.", "स्थिति नहीं मिली। Windows/फ़ोन की लोकेशन सेवा चालू करें।")
-            : tr("Location request timed out. Try again.", "स्थान का अनुरोध समय पर पूरा नहीं हुआ। दोबारा कोशिश करें।");
-        toast("error", tr("Location failed", "स्थान नहीं मिला"), msg);
+        if (err.code === 1) {
+          stopAll();
+          toast("error", tr("Location failed", "स्थान नहीं मिला"), failMsg(1));
+        }
       },
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
     );
-    timer = setTimeout(finish, 15000);
+
+    // Stage 2: GPS refinement; keeps the best fix for up to 25 s.
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        apply(pos);
+      },
+      (err) => {
+        if (err.code === 1) {
+          stopAll();
+          toast("error", tr("Location failed", "स्थान नहीं मिला"), failMsg(1));
+        }
+        /* timeout / unavailable: keep waiting until the overall timer ends */
+      },
+      { enableHighAccuracy: true, timeout: 25000, maximumAge: 0 }
+    );
+
+    stopTimer = setTimeout(() => {
+      const had = gotAny;
+      const acc = bestAcc;
+      stopAll();
+      if (!had) {
+        toast("error", tr("Location failed", "स्थान नहीं मिला"), failMsg(2));
+      } else if (acc > 100) {
+        toast("warning", tr("Location is rough", "स्थान मोटा-मोटा है"), tr(`Accuracy about ${Math.round(acc)} m. Drag the pin to the exact spot.`, `सटीकता लगभग ${Math.round(acc)} मीटर। पिन को सही जगह खींचकर रखें।`));
+      }
+    }, 26000);
   };
 
   const recogRef = useRef<any>(null);
@@ -223,12 +247,15 @@ function ReportInner() {
     recogRef.current = rec;
     rec.lang = hi ? "hi-IN" : "en-IN";
     rec.interimResults = true;
-    rec.continuous = true;
+    rec.continuous = false; // Android Chrome is unreliable in continuous mode
     rec.maxAlternatives = 1;
     const base = description.trim();
     let finalText = "";
+    let heard = false;
+    let errored = false;
     rec.onstart = () => setListening(true);
     rec.onresult = (ev: any) => {
+      heard = true;
       let interim = "";
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
         const t = ev.results[i][0].transcript;
@@ -240,6 +267,7 @@ function ReportInner() {
     };
     rec.onerror = (ev: any) => {
       const code = ev.error as string;
+      errored = true;
       if (code === "aborted") return;
       const msg =
         code === "not-allowed" || code === "service-not-allowed"
@@ -251,7 +279,10 @@ function ReportInner() {
           : tr("Voice service error (needs internet). Try again.", "वॉइस सेवा में त्रुटि (इंटरनेट चाहिए)। दोबारा कोशिश करें।");
       toast("error", tr("Voice failed", "वॉइस विफल"), msg);
     };
-    rec.onend = () => setListening(false);
+    rec.onend = () => {
+      setListening(false);
+      if (!heard && !errored) toast("warning", tr("Nothing heard", "कुछ सुनाई नहीं दिया"), tr("Tap the mic, wait for the beep/Listening, then speak clearly.", "माइक दबाएँ, 'Listening' दिखने पर साफ़ बोलें।"));
+    };
     try {
       rec.start();
     } catch {
@@ -571,7 +602,7 @@ function ReportInner() {
               <p className="mt-1.5 text-xs text-slate-500">
                 {coords
                   ? `${coords.lat.toFixed(5)}, ${coords.lng.toFixed(5)}`
-                  : tr("Tap anywhere on the map to drop a pin.", "पिन लगाने के लिए नक्शे पर कहीं भी टैप करें।")}
+                  : tr("Tap the map to drop a pin, or drag the pin to adjust.", "पिन लगाने के लिए नक्शे पर टैप करें, या पिन खींचकर सही करें।")}
               </p>
             </div>
           </Card>
