@@ -45,18 +45,6 @@ import { demoImage } from "@/lib/art";
 
 type Stage = "form" | "analyzing" | "duplicate" | "done";
 
-const VOICE_SAMPLES: Record<string, { en: string; hi: string }> = {
-  pothole: {
-    en: "There is a large pothole near the school gate on this road. Vehicles are swerving and children are at risk.",
-    hi: "इस सड़क पर स्कूल के गेट के पास एक बड़ा गड्ढा है। गाड़ियाँ बचकर निकलती हैं और बच्चों को खतरा है।",
-  },
-  garbage: { en: "Garbage has been piling up here for a week and it smells terrible.", hi: "यहाँ एक हफ़्ते से कचरा जमा है और बहुत बदबू आ रही है।" },
-  streetlight: { en: "The streetlight on this road is not working and the whole stretch is dark at night.", hi: "इस सड़क की स्ट्रीटलाइट खराब है और रात में पूरा हिस्सा अंधेरा रहता है।" },
-  water: { en: "A major water pipeline is leaking and water is flowing onto the road.", hi: "पानी की मुख्य पाइपलाइन लीक हो रही है और पानी सड़क पर बह रहा है।" },
-  drain: { en: "The drain is blocked and dirty water is overflowing onto the footpath.", hi: "नाली जाम है और गंदा पानी फुटपाथ पर बह रहा है।" },
-  safety: { en: "There is an open manhole on the road. It is dangerous for vehicles.", hi: "सड़क पर एक खुला मैनहोल है। यह गाड़ियों के लिए खतरनाक है।" },
-  other: { en: "The footpath tiles are broken and it is hard for elderly people to walk.", hi: "फुटपाथ की टाइलें टूटी हैं और बुज़ुर्गों को चलने में दिक्कत होती है।" },
-};
 
 function ReportInner() {
   const allowed = useRequireRole("citizen");
@@ -126,27 +114,105 @@ function ReportInner() {
     mark("location");
   };
 
-  const useCurrentLocation = () => {
-    setLocating(true);
-    // Demo mode: simulate GPS next to the Sector 62 school so the duplicate-detection demo works offline.
-    later(() => {
-      setLocation(DEMO_GPS.lat, DEMO_GPS.lng, "Near Govt. Inter College, Sector 62, Noida");
-      setLocating(false);
-      toast("success", tr("Location detected", "स्थान मिल गया"), tr("Using demo GPS: Sector 62, Noida.", "डेमो GPS: सेक्टर 62, नोएडा।"));
-    }, 900);
+  const demoLocation = () => {
+    // Fallback: fixed point next to the Sector 62 school so the duplicate-detection demo works.
+    setLocation(DEMO_GPS.lat, DEMO_GPS.lng, "Near Govt. Inter College, Sector 62, Noida");
+    toast("info", tr("Using demo location", "डेमो स्थान का उपयोग"), tr("Sector 62, Noida (sample GPS).", "सेक्टर 62, नोएडा (नमूना GPS)।"));
   };
 
-  const startVoice = () => {
-    if (listening) return;
-    setListening(true);
-    later(() => {
-      const s = VOICE_SAMPLES[category || "pothole"];
-      setDescription(hi ? s.hi : s.en);
-      setErrors((e) => ({ ...e, description: "" }));
-      setListening(false);
-      toast("info", tr("Voice captured", "आवाज़ दर्ज हुई"), tr("Simulated transcription added to the description.", "नकली ट्रांसक्रिप्शन विवरण में जोड़ा गया।"));
-    }, 2600);
+  const useCurrentLocation = () => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      toast("error", tr("GPS not supported", "GPS समर्थित नहीं"), tr("Tap the map or type the address.", "नक्शे पर टैप करें या पता लिखें।"));
+      return;
+    }
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude: lat, longitude: lng } = pos.coords;
+        let addr: string | undefined;
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 4000);
+          const r = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`,
+            { signal: ctrl.signal, headers: { Accept: "application/json" } }
+          );
+          clearTimeout(t);
+          const j = await r.json();
+          if (j?.display_name) addr = String(j.display_name);
+        } catch {
+          /* address lookup is optional; coordinates are enough */
+        }
+        setLocation(lat, lng, addr ?? `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
+        setLocating(false);
+        toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${Math.round(pos.coords.accuracy)} m.`, `सटीकता लगभग ${Math.round(pos.coords.accuracy)} मीटर।`));
+      },
+      (err) => {
+        setLocating(false);
+        const msg =
+          err.code === 1
+            ? tr("Location permission denied. Allow it in the browser's address bar (lock icon) and try again.", "स्थान की अनुमति नहीं मिली। ब्राउज़र के लॉक आइकन से अनुमति दें और दोबारा कोशिश करें।")
+            : err.code === 2
+            ? tr("Could not determine your position. Turn on device location/GPS.", "आपकी स्थिति नहीं मिली। डिवाइस की लोकेशन/GPS चालू करें।")
+            : tr("Location request timed out. Try again.", "स्थान का अनुरोध समय पर पूरा नहीं हुआ। दोबारा कोशिश करें।");
+        toast("error", tr("Location failed", "स्थान नहीं मिला"), msg);
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+    );
   };
+
+  const recogRef = useRef<any>(null);
+
+  const startVoice = () => {
+    if (listening) {
+      recogRef.current?.stop();
+      return;
+    }
+    const SR = typeof window !== "undefined" ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition : null;
+    if (!SR) {
+      toast("error", tr("Voice not supported", "वॉइस समर्थित नहीं"), tr("Use Google Chrome or Edge, or type the description.", "Google Chrome या Edge उपयोग करें, या विवरण टाइप करें।"));
+      return;
+    }
+    const rec = new SR();
+    recogRef.current = rec;
+    rec.lang = hi ? "hi-IN" : "en-IN";
+    rec.interimResults = true;
+    rec.continuous = true;
+    const base = description.trim();
+    let finalText = "";
+    rec.onstart = () => setListening(true);
+    rec.onresult = (ev: any) => {
+      let interim = "";
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const t = ev.results[i][0].transcript;
+        if (ev.results[i].isFinal) finalText += t + " ";
+        else interim += t;
+      }
+      setDescription([base, (finalText + interim).trim()].filter(Boolean).join(" "));
+      setErrors((e) => ({ ...e, description: "" }));
+    };
+    rec.onerror = (ev: any) => {
+      const code = ev.error as string;
+      if (code === "aborted") return;
+      const msg =
+        code === "not-allowed" || code === "service-not-allowed"
+          ? tr("Microphone permission denied. Allow it in the browser's address bar and try again.", "माइक्रोफ़ोन की अनुमति नहीं मिली। ब्राउज़र के एड्रेस बार से अनुमति दें और दोबारा कोशिश करें।")
+          : code === "no-speech"
+          ? tr("No speech heard. Tap the mic and speak clearly.", "कोई आवाज़ नहीं सुनी। माइक दबाकर साफ़ बोलें।")
+          : code === "audio-capture"
+          ? tr("No microphone found.", "माइक्रोफ़ोन नहीं मिला।")
+          : tr("Voice service error (needs internet). Try again.", "वॉइस सेवा में त्रुटि (इंटरनेट चाहिए)। दोबारा कोशिश करें।");
+      toast("error", tr("Voice failed", "वॉइस विफल"), msg);
+    };
+    rec.onend = () => setListening(false);
+    try {
+      rec.start();
+    } catch {
+      setListening(false);
+    }
+  };
+
+  useEffect(() => () => recogRef.current?.abort?.(), []);
 
   const validate = () => {
     const e: Record<string, string> = {};
@@ -380,7 +446,6 @@ function ReportInner() {
             <button
               type="button"
               onClick={startVoice}
-              disabled={listening}
               aria-label={tr("Describe the problem by voice", "आवाज़ से समस्या बताएँ")}
               className={cn(
                 "mt-3 flex w-full items-center justify-center gap-3 rounded-xl border-2 border-dashed px-4 py-3 text-sm font-semibold transition",
@@ -390,9 +455,9 @@ function ReportInner() {
               <span className={cn("flex h-9 w-9 items-center justify-center rounded-full text-white", listening ? "animate-pulse bg-red-500" : "bg-brand-600")}>
                 <Mic className="h-5 w-5" />
               </span>
-              {listening ? tr("Listening… speak now", "सुन रहा है… अब बोलिए") : tr("Describe the problem by voice", "आवाज़ से समस्या बताएँ")}
+              {listening ? tr("Listening… tap to stop", "सुन रहा है… रोकने के लिए टैप करें") : tr("Describe the problem by voice", "आवाज़ से समस्या बताएँ")}
             </button>
-            <p className="mt-1 text-xs text-slate-400">{tr("Prototype: voice transcription is simulated.", "प्रोटोटाइप: आवाज़ ट्रांसक्रिप्शन नकली (सिम्युलेटेड) है।")}</p>
+            <p className="mt-1 text-xs text-slate-400">{tr("Real speech-to-text (Chrome/Edge, needs mic permission and internet). Language follows the EN/हिं toggle.", "असली स्पीच-टू-टेक्स्ट (Chrome/Edge, माइक अनुमति और इंटरनेट चाहिए)। भाषा EN/हिं टॉगल के अनुसार।")}</p>
           </Card>
 
           <Card className="p-5">
@@ -446,6 +511,9 @@ function ReportInner() {
                 placeholder={tr("Address or landmark", "पता या लैंडमार्क")}
               />
             </Field>
+            <button type="button" onClick={demoLocation} className="mt-2 text-xs font-semibold text-orange-700 hover:underline">
+              {tr("Not in Noida? Use demo location (Sector 62)", "नोएडा में नहीं हैं? डेमो स्थान (सेक्टर 62) उपयोग करें")}
+            </button>
             <div className="mt-3">
               <CityMap
                 complaints={complaints.filter((c) => c.status !== "resolved")}
