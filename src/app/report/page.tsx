@@ -154,6 +154,7 @@ function ReportInner() {
     let watchId = -1;
     let stopTimer: ReturnType<typeof setTimeout> | undefined;
     let reverseSeq = 0;
+    const t0 = Date.now();
 
     const stopAll = () => {
       if (watchId >= 0) navigator.geolocation.clearWatch(watchId);
@@ -161,26 +162,30 @@ function ReportInner() {
       setLocating(false);
     };
 
-    const apply = async (pos: GeolocationPosition) => {
+    const apply = (pos: GeolocationPosition) => {
       const { latitude: lat, longitude: lng, accuracy } = pos.coords;
       if (accuracy >= bestAcc) return; // only accept better fixes
       bestAcc = accuracy;
       gotAny = true;
       setLocation(lat, lng, `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
+      // address lookup runs in the background and never delays the pin
       const seq = ++reverseSeq;
-      try {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 4000);
-        const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`, { signal: ctrl.signal });
-        clearTimeout(t);
-        const j = await r.json();
-        if (j?.display_name && seq === reverseSeq) setAddress(String(j.display_name));
-      } catch {
-        /* address lookup is optional */
-      }
-      const m = Math.round(accuracy);
-      if (accuracy <= 50) {
-        toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${m} m.`, `सटीकता लगभग ${m} मीटर।`));
+      (async () => {
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 3000);
+          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`, { signal: ctrl.signal });
+          clearTimeout(t);
+          const j = await r.json();
+          if (j?.display_name && seq === reverseSeq) setAddress(String(j.display_name));
+        } catch {
+          /* address lookup is optional */
+        }
+      })();
+      const elapsed = Date.now() - t0;
+      // good enough: <=40 m right away, <=80 m after 4 s, <=120 m after 7 s
+      if (accuracy <= 40 || (elapsed > 4000 && accuracy <= 80) || (elapsed > 7000 && accuracy <= 120)) {
+        toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${Math.round(accuracy)} m.`, `सटीकता लगभग ${Math.round(accuracy)} मीटर।`));
         stopAll();
       }
     };
@@ -201,7 +206,7 @@ function ReportInner() {
           toast("error", tr("Location failed", "स्थान नहीं मिला"), failMsg(1));
         }
       },
-      { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
+      { enableHighAccuracy: false, timeout: 6000, maximumAge: 30000 }
     );
 
     // Stage 2: GPS refinement; keeps the best fix for up to 25 s.
@@ -216,7 +221,7 @@ function ReportInner() {
         }
         /* timeout / unavailable: keep waiting until the overall timer ends */
       },
-      { enableHighAccuracy: true, timeout: 25000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
 
     stopTimer = setTimeout(() => {
@@ -228,7 +233,7 @@ function ReportInner() {
       } else if (acc > 100) {
         toast("warning", tr("Location is rough", "स्थान मोटा-मोटा है"), tr(`Accuracy about ${Math.round(acc)} m. Drag the pin to the exact spot.`, `सटीकता लगभग ${Math.round(acc)} मीटर। पिन को सही जगह खींचकर रखें।`));
       }
-    }, 26000);
+    }, 14000);
   };
 
   const recogRef = useRef<any>(null);
