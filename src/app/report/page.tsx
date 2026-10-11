@@ -19,7 +19,7 @@ import {
   Trash2,
   Users,
 } from "lucide-react";
-import { CityMap } from "@/components/CityMap";
+import { RealMap } from "@/components/RealMap";
 import { RoutingExplainer } from "@/components/ComplaintView";
 import {
   Button,
@@ -36,7 +36,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { DUPLICATE_RADIUS_M, PRIORITY_RULES, analyzeComplaint, detectedLabel } from "@/lib/ai";
-import { CATEGORIES, CATEGORY_MAP, DEMO_GPS, nearestArea } from "@/lib/data";
+import { CATEGORIES, CATEGORY_MAP, DEMO_GPS, MAP_BOUNDS, nearestArea } from "@/lib/data";
 import { useRequireRole } from "@/lib/guard";
 import { useApp } from "@/lib/store";
 import type { Analysis, CategoryKey, Complaint } from "@/lib/types";
@@ -108,8 +108,13 @@ function ReportInner() {
 
   const setLocation = (lat: number, lng: number, addr?: string) => {
     setCoords({ lat, lng });
-    const area = nearestArea(lat, lng).name;
-    setAddress(addr ?? `Near ${area}, Noida (${lat.toFixed(4)}, ${lng.toFixed(4)})`);
+    const inNoida = lat >= MAP_BOUNDS.latMin && lat <= MAP_BOUNDS.latMax && lng >= MAP_BOUNDS.lngMin && lng <= MAP_BOUNDS.lngMax;
+    setAddress(
+      addr ??
+        (inNoida
+          ? `Near ${nearestArea(lat, lng).name}, Noida (${lat.toFixed(4)}, ${lng.toFixed(4)})`
+          : `Selected location (${lat.toFixed(5)}, ${lng.toFixed(5)})`)
+    );
     setErrors((e) => ({ ...e, location: "" }));
     mark("location");
   };
@@ -118,6 +123,20 @@ function ReportInner() {
     // Fallback: fixed point next to the Sector 62 school so the duplicate-detection demo works.
     setLocation(DEMO_GPS.lat, DEMO_GPS.lng, "Near Govt. Inter College, Sector 62, Noida");
     toast("info", tr("Using demo location", "डेमो स्थान का उपयोग"), tr("Sector 62, Noida (sample GPS).", "सेक्टर 62, नोएडा (नमूना GPS)।"));
+  };
+
+  const pickOnMap = async (lat: number, lng: number) => {
+    setLocation(lat, lng);
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`, { signal: ctrl.signal });
+      clearTimeout(t);
+      const j = await r.json();
+      if (j?.display_name) setAddress(String(j.display_name));
+    } catch {
+      /* keep the coordinate-based address */
+    }
   };
 
   const useCurrentLocation = () => {
@@ -543,12 +562,11 @@ function ReportInner() {
               {tr("Not in Noida? Use demo location (Sector 62)", "नोएडा में नहीं हैं? डेमो स्थान (सेक्टर 62) उपयोग करें")}
             </button>
             <div className="mt-3">
-              <CityMap
+              <RealMap
                 complaints={complaints.filter((c) => c.status !== "resolved")}
                 picked={coords}
-                focus={coords}
-                onPick={(lat, lng) => setLocation(lat, lng)}
-                className="h-60"
+                onPick={pickOnMap}
+                className="h-72"
               />
               <p className="mt-1.5 text-xs text-slate-500">
                 {coords
