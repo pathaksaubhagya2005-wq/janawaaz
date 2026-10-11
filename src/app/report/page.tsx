@@ -126,39 +126,66 @@ function ReportInner() {
       return;
     }
     setLocating(true);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude: lat, longitude: lng } = pos.coords;
-        let addr: string | undefined;
-        try {
-          const ctrl = new AbortController();
-          const t = setTimeout(() => ctrl.abort(), 4000);
-          const r = await fetch(
-            `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`,
-            { signal: ctrl.signal, headers: { Accept: "application/json" } }
-          );
-          clearTimeout(t);
-          const j = await r.json();
-          if (j?.display_name) addr = String(j.display_name);
-        } catch {
-          /* address lookup is optional; coordinates are enough */
-        }
-        setLocation(lat, lng, addr ?? `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
+    // Keep listening for up to 15 s and use the most accurate fix (laptops often give a rough Wi-Fi fix first).
+    let best: GeolocationPosition | null = null;
+    let finished = false;
+    let watchId = 0;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const finish = async () => {
+      if (finished) return;
+      finished = true;
+      navigator.geolocation.clearWatch(watchId);
+      clearTimeout(timer);
+      if (!best) {
         setLocating(false);
-        toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${Math.round(pos.coords.accuracy)} m.`, `सटीकता लगभग ${Math.round(pos.coords.accuracy)} मीटर।`));
+        toast("error", tr("Location failed", "स्थान नहीं मिला"), tr("Could not get a position. Turn on device location or tap the map.", "स्थिति नहीं मिली। डिवाइस लोकेशन चालू करें या नक्शे पर टैप करें।"));
+        return;
+      }
+      const { latitude: lat, longitude: lng, accuracy } = best.coords;
+      let addr: string | undefined;
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 4000);
+        const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=${lat}&lon=${lng}`, { signal: ctrl.signal });
+        clearTimeout(t);
+        const j = await r.json();
+        if (j?.display_name) addr = String(j.display_name);
+      } catch {
+        /* address lookup is optional */
+      }
+      setLocation(lat, lng, addr ?? `GPS location (${lat.toFixed(5)}, ${lng.toFixed(5)})`);
+      setLocating(false);
+      const m = Math.round(accuracy);
+      if (accuracy > 150) {
+        toast("warning", tr("Location is rough", "स्थान मोटा-मोटा है"), tr(`Accuracy about ${m} m (laptop Wi-Fi location). Edit the address, or open this site on your phone for exact GPS.`, `सटीकता लगभग ${m} मीटर (लैपटॉप का Wi-Fi स्थान)। पता सुधारें, या सटीक GPS के लिए फ़ोन पर खोलें।`));
+      } else {
+        toast("success", tr("Location detected", "स्थान मिल गया"), tr(`Accuracy about ${m} m.`, `सटीकता लगभग ${m} मीटर।`));
+      }
+    };
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        if (!best || pos.coords.accuracy < best.coords.accuracy) best = pos;
+        if (pos.coords.accuracy <= 30) finish();
       },
       (err) => {
+        if (best) return;
+        finished = true;
+        navigator.geolocation.clearWatch(watchId);
+        clearTimeout(timer);
         setLocating(false);
         const msg =
           err.code === 1
-            ? tr("Location permission denied. Allow it in the browser's address bar (lock icon) and try again.", "स्थान की अनुमति नहीं मिली। ब्राउज़र के लॉक आइकन से अनुमति दें और दोबारा कोशिश करें।")
+            ? tr("Location permission denied. Click the lock icon in the address bar, set Location to Allow, then refresh.", "स्थान की अनुमति नहीं मिली। एड्रेस बार के लॉक आइकन से Location को Allow करें और पेज रिफ्रेश करें।")
             : err.code === 2
-            ? tr("Could not determine your position. Turn on device location/GPS.", "आपकी स्थिति नहीं मिली। डिवाइस की लोकेशन/GPS चालू करें।")
+            ? tr("Could not determine position. Turn on Windows/phone location services.", "स्थिति नहीं मिली। Windows/फ़ोन की लोकेशन सेवा चालू करें।")
             : tr("Location request timed out. Try again.", "स्थान का अनुरोध समय पर पूरा नहीं हुआ। दोबारा कोशिश करें।");
         toast("error", tr("Location failed", "स्थान नहीं मिला"), msg);
       },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
+    timer = setTimeout(finish, 15000);
   };
 
   const recogRef = useRef<any>(null);
@@ -178,6 +205,7 @@ function ReportInner() {
     rec.lang = hi ? "hi-IN" : "en-IN";
     rec.interimResults = true;
     rec.continuous = true;
+    rec.maxAlternatives = 1;
     const base = description.trim();
     let finalText = "";
     rec.onstart = () => setListening(true);
